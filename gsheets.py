@@ -11,16 +11,10 @@ _initialized: set[str] = set()
 
 
 def _service():
-    # クラウド環境: 環境変数から直接読む
-    sa_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
-    if sa_json:
-        import json
-        creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=_SCOPES)
-    else:
-        creds = Credentials.from_service_account_file(
-            os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE', 'service_account.json'),
-            scopes=_SCOPES,
-        )
+    creds = Credentials.from_service_account_file(
+        os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE', 'service_account.json'),
+        scopes=_SCOPES,
+    )
     return build('sheets', 'v4', credentials=creds)
 
 

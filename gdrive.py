@@ -1,5 +1,4 @@
 import io
-import json
 import os
 
 from google.auth.transport.requests import Request
@@ -15,22 +14,17 @@ _TOKEN_FILE = 'drive_token.json'
 def _service():
     creds = None
 
-    # クラウド環境: 環境変数からトークンを読む
-    token_json = os.getenv('DRIVE_TOKEN_JSON')
-    if token_json:
-        creds = Credentials.from_authorized_user_info(json.loads(token_json), _SCOPES)
-    elif os.path.exists(_TOKEN_FILE):
+    if os.path.exists(_TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(_TOKEN_FILE, _SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            # クラウドではブラウザ認証不可: ローカルで auth_drive.py を実行してください
-            raise RuntimeError(
-                'Drive認証トークンが見つかりません。'
-                'ローカルで auth_drive.py を実行してから DRIVE_TOKEN_JSON を設定してください。'
-            )
+            flow = InstalledAppFlow.from_client_secrets_file('oauth_credentials.json', _SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(_TOKEN_FILE, 'w') as f:
+            f.write(creds.to_json())
 
     return build('drive', 'v3', credentials=creds)
 
