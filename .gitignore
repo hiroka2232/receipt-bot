@@ -1,0 +1,6 @@
+.env
+service_account.json
+oauth_credentials.json
+drive_token.json
+__pycache__/
+*.pyc
