@@ -36,7 +36,7 @@ def _load_creds() -> Credentials:
     # ローカル初回のみ、明示的に許可されていればブラウザ認証を行う。
     if config.ALLOW_INTERACTIVE_AUTH:
         from google_auth_oauthlib.flow import InstalledAppFlow
-        flow  = InstalledAppFlow.from_client_secrets_file('oauth_credentials.json', _SCOPES)
+        flow  = InstalledAppFlow.from_client_secrets_file(config.oauth_credentials_file(), _SCOPES)
         creds = flow.run_local_server(port=0)
         _save_creds(creds)
         return creds

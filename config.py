@@ -12,7 +12,17 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# このファイル（＝プロジェクト直下）の場所。秘密ファイルはここ基準で解決する。
+# こうすることで、どのディレクトリから起動してもファイルを見つけられる。
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# .env もプロジェクト直下から読む（起動場所に依存しない）
+load_dotenv(os.path.join(_BASE_DIR, '.env'))
+
+
+def _resolve(path: str) -> str:
+    """相対パスをプロジェクト直下基準の絶対パスに変換する。"""
+    return path if os.path.isabs(path) else os.path.join(_BASE_DIR, path)
 
 
 # ── Discord ───────────────────────────────────────────────
@@ -38,13 +48,17 @@ def service_account_info() -> dict:
     raw = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
     if raw:
         return json.loads(raw)
-    path = os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE', 'service_account.json')
+    path = _resolve(os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE', 'service_account.json'))
     with open(path, encoding='utf-8') as f:
         return json.load(f)
 
 
 def drive_token_file() -> str:
-    return os.getenv('GOOGLE_DRIVE_TOKEN_FILE', 'drive_token.json')
+    return _resolve(os.getenv('GOOGLE_DRIVE_TOKEN_FILE', 'drive_token.json'))
+
+
+def oauth_credentials_file() -> str:
+    return _resolve(os.getenv('GOOGLE_OAUTH_CREDENTIALS_FILE', 'oauth_credentials.json'))
 
 
 def drive_token_from_env() -> bool:
