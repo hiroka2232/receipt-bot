@@ -1,0 +1,14 @@
+# イメージに含めない（秘密情報や不要物）。
+# 秘密情報は環境変数で渡すため、ファイルはイメージに焼き込まない。
+.env
+*.json
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+README.md
+Dockerfile
+.dockerignore
+docker-compose.yml

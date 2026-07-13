@@ -1,0 +1,14 @@
+# docker compose up -d でバックグラウンド常駐起動。
+# restart: unless-stopped により、クラッシュやサーバ再起動後も自動で復帰する。
+services:
+  bot:
+    build: .
+    container_name: receipt-bot
+    restart: unless-stopped
+    # .env の中身をすべて環境変数としてコンテナに渡す。
+    # サーバ運用時は、秘密情報のJSONも1行にして .env に入れておく（README参照）。
+    env_file:
+      - .env
+    # サーバでは対話認証を絶対に行わない
+    environment:
+      - ALLOW_INTERACTIVE_AUTH=0

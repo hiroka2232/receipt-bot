@@ -1,7 +1,7 @@
-import os
-
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+
+import config
 
 _SCOPES  = ['https://www.googleapis.com/auth/spreadsheets']
 _HEADERS = ['日付', '内容', '金額', '領収書等', '備考']
@@ -11,8 +11,8 @@ _initialized: set[str] = set()
 
 
 def _service():
-    creds = Credentials.from_service_account_file(
-        os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE', 'service_account.json'),
+    creds = Credentials.from_service_account_info(
+        config.service_account_info(),
         scopes=_SCOPES,
     )
     return build('sheets', 'v4', credentials=creds)
@@ -98,7 +98,7 @@ def _ensure_header(svc, sid: str, sheet_name: str):
 
 def _append_row(sheet_name: str, row: list):
     svc = _service()
-    sid = os.getenv('GOOGLE_SHEETS_ID')
+    sid = config.GOOGLE_SHEETS_ID
     _ensure_header(svc, sid, sheet_name)
     svc.spreadsheets().values().append(
         spreadsheetId=sid,

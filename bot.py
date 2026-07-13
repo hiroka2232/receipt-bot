@@ -1,4 +1,3 @@
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -6,16 +5,14 @@ from typing import Optional
 import aiohttp
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
 
-load_dotenv()
-
+import config
 from gemini import parse_receipt, parse_income_text, parse_followup
 from gdrive import upload_receipt
 from gsheets import append_expense, append_income
 
-RECEIPT_CHANNEL_ID = int(os.getenv('RECEIPT_CHANNEL_ID', 0))
-INCOME_CHANNEL_ID  = int(os.getenv('INCOME_CHANNEL_ID', 0))
+RECEIPT_CHANNEL_ID = config.RECEIPT_CHANNEL_ID
+INCOME_CHANNEL_ID  = config.INCOME_CHANNEL_ID
 PENDING_TTL        = 600  # 10分でタイムアウト
 
 intents = discord.Intents.default()
@@ -289,4 +286,6 @@ async def cancel_cmd(ctx: commands.Context):
         await ctx.reply('進行中の記録はありません。')
 
 
-bot.run(os.getenv('DISCORD_TOKEN'))
+if __name__ == '__main__':
+    config.validate()
+    bot.run(config.DISCORD_TOKEN)

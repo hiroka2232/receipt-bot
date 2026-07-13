@@ -1,6 +1,8 @@
-discord.py>=2.3.2
-google-generativeai>=0.8.0
-google-api-python-client>=2.100.0
-google-auth>=2.23.0
-aiohttp>=3.9.0
-python-dotenv>=1.0.0
+# レシートボットの依存関係（検証済みバージョンに固定）
+discord.py==2.7.1
+google-genai==2.11.0
+google-api-python-client==2.198.0
+google-auth==2.55.2
+google-auth-oauthlib==1.4.0
+aiohttp==3.14.1
+python-dotenv==1.2.2

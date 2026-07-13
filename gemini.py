@@ -1,13 +1,14 @@
 import asyncio
 import json
-import os
 import re
 
 from google import genai
 from google.genai import types
 
-_client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
-_MODEL  = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
+import config
+
+_client = genai.Client(api_key=config.GEMINI_API_KEY)
+_MODEL  = config.GEMINI_MODEL
 
 
 def _extract_json(text: str) -> dict | None:
