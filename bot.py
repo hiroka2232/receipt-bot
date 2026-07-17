@@ -7,13 +7,17 @@ import discord
 from discord.ext import commands
 
 import config
-from gemini import parse_receipt, parse_income_text, parse_followup
-from gdrive import upload_receipt
-from gsheets import append_expense, append_income
+from gemini import parse_receipt, parse_income_text, parse_followup, parse_edit
+from gdrive import upload_receipt, rename_file
+from gsheets import append_expense, append_income, update_expense, update_income
 
 RECEIPT_CHANNEL_ID = config.RECEIPT_CHANNEL_ID
 INCOME_CHANNEL_ID  = config.INCOME_CHANNEL_ID
-PENDING_TTL        = 600  # 10分でタイムアウト
+PENDING_TTL        = 600   # 確定前の会話が10分で失効
+RECORDED_TTL       = 3600  # 記録済みエントリを修正できる猶予（1時間）
+
+NOTE_NEW    = 'AI自動記録（Gemini）'
+NOTE_EDITED = 'AI自動記録（Gemini）／修正あり'
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -29,10 +33,30 @@ class PendingEntry:
     image_data: Optional[bytes] = None
     mime_type:  Optional[str]   = None
     original_ext: Optional[str] = None  # jpg / png など
+    store: Optional[str] = None         # data['content'] の組み立て元
+    items: list = field(default_factory=list)
+
+
+@dataclass
+class RecordedEntry:
+    """記録済みエントリ。あとから修正指示を受けて上書きするために保持する。"""
+    entry_type: str
+    data: dict                  # date, content, amount
+    row: int                    # スプレッドシート上の行番号
+    store: Optional[str] = None
+    items: list = field(default_factory=list)
+    drive_file_id: Optional[str] = None
+    drive_link: str = ''
+    filename: Optional[str] = None
+    original_ext: Optional[str] = None
+    ts: float = field(default_factory=time.time)
 
 
 # (channel_id, user_id) → PendingEntry
 _pending: dict[tuple[int, int], PendingEntry] = {}
+
+# (channel_id, user_id) → 直近に記録した RecordedEntry
+_recorded: dict[tuple[int, int], RecordedEntry] = {}
 
 
 # ── ヘルパー ──────────────────────────────────────────────
@@ -49,21 +73,36 @@ def _fmt_amount(val) -> str:
         return str(val)
 
 
-def _summary(entry: PendingEntry) -> str:
-    d    = entry.data
-    kind = '支出' if entry.entry_type == 'expense' else '収入'
+def _to_int(val) -> Optional[int]:
+    try:
+        return int(float(str(val)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _render_content(store, items: list) -> Optional[str]:
+    """店名と品目から「内容」列の文字列を組み立てる。"""
+    items_str = '、'.join(
+        f"{i['name']}(¥{i['price']})" for i in (items or []) if i.get('name')
+    )
+    store = str(store) if store else ''
+    return f'{store}（{items_str}）' if items_str else (store or None)
+
+
+def _summary(entry_type: str, data: dict) -> str:
+    kind = '支出' if entry_type == 'expense' else '収入'
     lines = [
         f'**【{kind}】**',
-        f'📅 日付 : {d.get("date") or "❓ 不明"}',
-        f'📝 内容 : {d.get("content") or "❓ 不明"}',
-        f'💴 金額 : {_fmt_amount(d["amount"]) if d.get("amount") else "❓ 不明"}',
+        f'📅 日付 : {data.get("date") or "❓ 不明"}',
+        f'📝 内容 : {data.get("content") or "❓ 不明"}',
+        f'💴 金額 : {_fmt_amount(data["amount"]) if data.get("amount") else "❓ 不明"}',
     ]
     return '\n'.join(lines)
 
 
 def _build_message(entry: PendingEntry) -> str:
     miss = _missing(entry.data)
-    base = _summary(entry)
+    base = _summary(entry.entry_type, entry.data)
     if miss:
         return (
             f'{base}\n\n'
@@ -79,14 +118,12 @@ def _build_message(entry: PendingEntry) -> str:
     )
 
 
-def _make_filename(entry: PendingEntry) -> str:
-    d         = entry.data
-    date_raw  = str(d.get('date') or 'unknown').replace('-', '')
+def _make_filename(date, content, ext) -> str:
+    date_raw  = str(date or 'unknown').replace('-', '')
     # 内容の先頭部分（括弧の前まで）を店名として使う
-    content   = str(d.get('content') or 'unknown')
+    content   = str(content or 'unknown')
     store_raw = content.split('（')[0].strip().replace(' ', '_').replace('/', '_')[:20]
-    ext       = entry.original_ext or 'jpg'
-    return f'{date_raw}_{store_raw}.{ext}'
+    return f'{date_raw}_{store_raw}.{ext or "jpg"}'
 
 
 # ── イベントハンドラ ──────────────────────────────────────
@@ -124,10 +161,17 @@ async def on_message(message: discord.Message):
             await _start_expense(message, key, imgs[0])
             return
 
-    # ── 新規: 収入テキスト ──
-    if ch == INCOME_CHANNEL_ID and message.content.strip() and not message.attachments:
-        await _start_income(message, key)
-        return
+    text = message.content.strip()
+    if text and not message.attachments and not text.startswith(bot.command_prefix):
+        # ── 記録済みエントリへの修正指示か？ ──
+        # 収入テキストと同じチャンネルに来うるので、収入として扱う前に判定する。
+        if await _try_edit(message, key, text):
+            return
+
+        # ── 新規: 収入テキスト ──
+        if ch == INCOME_CHANNEL_ID:
+            await _start_income(message, key)
+            return
 
     await bot.process_commands(message)
 
@@ -146,10 +190,9 @@ async def _start_expense(message: discord.Message, key: tuple, att: discord.Atta
             await status.edit(content='❌ Geminiの応答をJSONに変換できませんでした。ログを確認してください。')
             return
 
-        items     = raw.get('items') or []
-        items_str = '、'.join(f"{i['name']}(¥{i['price']})" for i in items if i.get('name'))
-        store     = raw.get('store') or ''
-        content   = f'{store}（{items_str}）' if items_str else (store or None)
+        items   = raw.get('items') or []
+        store   = raw.get('store') or ''
+        content = _render_content(store, items)
 
         entry_data = {
             'date':    raw.get('date'),
@@ -165,6 +208,8 @@ async def _start_expense(message: discord.Message, key: tuple, att: discord.Atta
             image_data=img,
             mime_type=att.content_type,
             original_ext=ext,
+            store=store,
+            items=items,
         )
         _pending[key] = entry
         await status.edit(content=_build_message(entry))
@@ -228,7 +273,7 @@ async def _handle_followup(message: discord.Message, key: tuple, entry: PendingE
     # 確定: 全項目あり + confirmアクション
     if action == 'confirm' and not miss:
         del _pending[key]
-        await _finalize(message, entry)
+        await _finalize(message, key, entry)
         return
 
     # まだ不足があるか、updateアクション → 状態を更新して再表示
@@ -238,40 +283,154 @@ async def _handle_followup(message: discord.Message, key: tuple, entry: PendingE
 
 # ── 確定・記録 ────────────────────────────────────────────
 
-async def _finalize(message: discord.Message, entry: PendingEntry):
+async def _finalize(message: discord.Message, key: tuple, entry: PendingEntry):
     status = await message.reply('⏳ 記録中...')
     try:
         d = entry.data
 
+        # 確定前のやり取りで content が直接書き換えられていると store/items と対応しない。
+        # その場合は構造を捨て、内容を1つの文字列として扱う（合計の再計算は諦める）。
+        if _render_content(entry.store, entry.items) == d['content']:
+            store, items = entry.store, entry.items
+        else:
+            store, items = d['content'], []
+
         if entry.entry_type == 'expense':
-            filename   = _make_filename(entry)
-            drive_link = upload_receipt(entry.image_data, filename, entry.mime_type)
-            append_expense(
+            filename        = _make_filename(d['date'], d['content'], entry.original_ext)
+            file_id, link   = upload_receipt(entry.image_data, filename, entry.mime_type)
+            row = append_expense(
                 date=str(d['date']),
                 content=str(d['content']),
                 amount=str(d['amount']),
-                drive_link=drive_link,
-                note='AI自動記録（Gemini）',
+                drive_link=link,
+                note=NOTE_NEW,
+            )
+            _recorded[key] = RecordedEntry(
+                entry_type='expense', data=dict(d), row=row,
+                store=store, items=items,
+                drive_file_id=file_id, drive_link=link, filename=filename,
+                original_ext=entry.original_ext,
             )
             await status.edit(content=(
                 f'✅ **支出を記録しました**\n'
-                f'{_summary(entry)}\n'
+                f'{_summary(entry.entry_type, d)}\n'
                 f'🗂 ファイル: `{filename}`\n'
-                f'🔗 Drive: {drive_link}'
+                f'🔗 Drive: {link}'
             ))
         else:
-            append_income(
+            row = append_income(
                 date=str(d['date']),
                 content=str(d['content']),
                 amount=str(d['amount']),
-                note='AI自動記録（Gemini）',
+                note=NOTE_NEW,
             )
-            await status.edit(content=f'✅ **収入を記録しました**\n{_summary(entry)}')
+            _recorded[key] = RecordedEntry(
+                entry_type='income', data=dict(d), row=row,
+                store=d['content'], items=[],
+            )
+            await status.edit(content=f'✅ **収入を記録しました**\n{_summary(entry.entry_type, d)}')
 
     except Exception as e:
         import traceback
         print(f'[bot] _finalize error:\n{traceback.format_exc()}', flush=True)
         await status.edit(content=f'❌ 記録中にエラー: {e}')
+
+
+# ── 記録済みエントリの修正 ────────────────────────────────
+
+def _sum_prices(items: list) -> Optional[int]:
+    """品目価格の合計。1つでも数値化できなければ None。"""
+    total = 0
+    for i in items or []:
+        price = _to_int(i.get('price'))
+        if price is None:
+            return None
+        total += price
+    return total
+
+
+def _edited_amount(rec: RecordedEntry, items: list, total):
+    """修正後の合計金額を決める。items は解決済み（rec.items へのフォールバック後）。
+
+    レシートの合計は税や値引きを含むため「品目の総和」とは限らない。
+    そこで品目の増減分だけを元の合計に加算し、税分などを保つ。
+
+    品目の価格が動いたときは、Geminiが total を返してきても採用しない。
+    合計の算術はここで行う方が確実なため（Geminiは指示に反して
+    変更前の total をそのまま返してくることがある）。
+    """
+    old_sum = _sum_prices(rec.items)
+    new_sum = _sum_prices(items)
+    old_amt = _to_int(rec.data.get('amount'))
+    if None not in (old_sum, new_sum, old_amt) and new_sum != old_sum:
+        return old_amt + (new_sum - old_sum)
+
+    # 品目の価格が変わっていない → 合計の明示指定だけを反映する
+    explicit = _to_int(total)
+    if explicit is not None:
+        return explicit
+    return rec.data.get('amount')
+
+
+async def _try_edit(message: discord.Message, key: tuple, text: str) -> bool:
+    """修正指示なら適用して True。そうでなければ False（呼び出し側で通常処理）。"""
+    rec = _recorded.get(key)
+    if rec is None:
+        return False
+    if time.time() - rec.ts > RECORDED_TTL:
+        del _recorded[key]
+        return False
+
+    result = await parse_edit(
+        entry_type=rec.entry_type,
+        date=rec.data.get('date'),
+        store=rec.store,
+        items=rec.items,
+        amount=rec.data.get('amount'),
+        user_message=text,
+    )
+    if result is None or result.get('intent') != 'edit':
+        return False
+
+    await _apply_edit(message, rec, result)
+    return True
+
+
+async def _apply_edit(message: discord.Message, rec: RecordedEntry, result: dict):
+    status = await message.reply('✏️ 記録を修正中...')
+    try:
+        date   = result.get('date')  or rec.data.get('date')
+        store  = result.get('store') or rec.store
+        items  = result.get('items') if result.get('items') is not None else rec.items
+        amount = _edited_amount(rec, items, result.get('total'))
+
+        if rec.entry_type == 'expense':
+            content  = _render_content(store, items)
+            filename = _make_filename(date, content, rec.original_ext)
+            if rec.drive_file_id and filename != rec.filename:
+                rename_file(rec.drive_file_id, filename)
+                rec.filename = filename
+            update_expense(rec.row, str(date), str(content), str(amount),
+                           rec.drive_link, NOTE_EDITED)
+        else:
+            content = store
+            update_income(rec.row, str(date), str(content), str(amount), NOTE_EDITED)
+
+        rec.data  = {'date': date, 'content': content, 'amount': amount}
+        rec.store = store
+        rec.items = items
+        rec.ts    = time.time()
+
+        lines = [f'✏️ **記録を修正しました**', _summary(rec.entry_type, rec.data)]
+        if rec.entry_type == 'expense':
+            lines.append(f'🗂 ファイル: `{rec.filename}`')
+            lines.append(f'🔗 Drive: {rec.drive_link}')
+        await status.edit(content='\n'.join(lines))
+
+    except Exception as e:
+        import traceback
+        print(f'[bot] _apply_edit error:\n{traceback.format_exc()}', flush=True)
+        await status.edit(content=f'❌ 修正中にエラー: {e}')
 
 
 # ── ユーティリティコマンド ────────────────────────────────

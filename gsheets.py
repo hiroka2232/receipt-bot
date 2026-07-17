@@ -1,3 +1,5 @@
+import re
+
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
@@ -96,21 +98,46 @@ def _ensure_header(svc, sid: str, sheet_name: str):
     _initialized.add(key)
 
 
-def _append_row(sheet_name: str, row: list):
+def _row_number(updated_range: str) -> int:
+    """append の updatedRange（例: '支出'!A5:E5）から行番号 5 を取り出す。"""
+    first_cell = updated_range.split('!')[-1].split(':')[0]
+    return int(re.sub(r'\D', '', first_cell))
+
+
+def _append_row(sheet_name: str, row: list) -> int:
+    """行を追記し、書き込まれた行番号を返す（後から修正するために必要）。"""
     svc = _service()
     sid = config.GOOGLE_SHEETS_ID
     _ensure_header(svc, sid, sheet_name)
-    svc.spreadsheets().values().append(
+    resp = svc.spreadsheets().values().append(
         spreadsheetId=sid,
         range=f'{sheet_name}!A:E',
         valueInputOption='USER_ENTERED',
         body={'values': [row]},
     ).execute()
+    return _row_number(resp['updates']['updatedRange'])
 
 
-def append_expense(date: str, content: str, amount: str, drive_link: str, note: str):
-    _append_row('支出', [date, content, amount, drive_link, note])
+def _update_row(sheet_name: str, row: int, values: list):
+    _service().spreadsheets().values().update(
+        spreadsheetId=config.GOOGLE_SHEETS_ID,
+        range=f'{sheet_name}!A{row}:E{row}',
+        valueInputOption='USER_ENTERED',
+        body={'values': [values]},
+    ).execute()
 
 
-def append_income(date: str, content: str, amount: str, note: str):
-    _append_row('収入', [date, content, amount, '', note])
+def append_expense(date: str, content: str, amount: str, drive_link: str, note: str) -> int:
+    return _append_row('支出', [date, content, amount, drive_link, note])
+
+
+def append_income(date: str, content: str, amount: str, note: str) -> int:
+    return _append_row('収入', [date, content, amount, '', note])
+
+
+def update_expense(row: int, date: str, content: str, amount: str, drive_link: str, note: str):
+    _update_row('支出', row, [date, content, amount, drive_link, note])
+
+
+def update_income(row: int, date: str, content: str, amount: str, note: str):
+    _update_row('収入', row, [date, content, amount, '', note])

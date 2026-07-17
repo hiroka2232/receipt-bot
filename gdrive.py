@@ -53,12 +53,20 @@ def _service():
     return build('drive', 'v3', credentials=_load_creds())
 
 
-def upload_receipt(image_data: bytes, filename: str, mime_type: str) -> str:
+def upload_receipt(image_data: bytes, filename: str, mime_type: str) -> tuple[str, str]:
+    """領収書を保存し、(ファイルID, 閲覧リンク) を返す。
+
+    ファイルIDは、後から記録を修正したときにリネームするために必要。
+    """
     svc = _service()
     metadata = {
         'name': filename,
         'parents': [config.GOOGLE_DRIVE_FOLDER_ID],
     }
     media = MediaIoBaseUpload(io.BytesIO(image_data), mimetype=mime_type)
-    f = svc.files().create(body=metadata, media_body=media, fields='webViewLink').execute()
-    return f.get('webViewLink', '')
+    f = svc.files().create(body=metadata, media_body=media, fields='id,webViewLink').execute()
+    return f['id'], f.get('webViewLink', '')
+
+
+def rename_file(file_id: str, new_name: str) -> None:
+    _service().files().update(fileId=file_id, body={'name': new_name}).execute()
