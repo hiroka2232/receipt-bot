@@ -182,7 +182,8 @@ async def on_message(message: discord.Message):
     # ── 新規: レシート画像（支出） ──
     if prof.accepts_receipt:
         imgs = [a for a in message.attachments
-                if a.content_type and a.content_type.startswith('image/')]
+                if a.content_type and (a.content_type.startswith('image/')
+                                       or a.content_type == 'application/pdf')]
         if imgs:
             await _start_expense(message, key, imgs[0])
             return
@@ -446,19 +447,11 @@ async def _apply_edit(message: discord.Message, rec: RecordedEntry, result: dict
         else:
             content, receipt = store, ''
 
-        # 日付の月が変わると記録先シートも変わる。元シートの行を消して
-        # 新しい月シートへ入れ直す（更新だけだと前月に残ってしまう）。
-        new_sheet = gsheets.sheet_name_for_date(date)
-        if new_sheet != rec.sheet_name:
-            gsheets.update_entry(prof.sheet_id, rec.sheet_name, rec.row,
-                                 '', '', '', '', '', '')  # 元の行を空にする
-            rec.sheet_name, rec.row = gsheets.append_entry(
-                prof.sheet_id, str(date), kind, str(content),
-                _amount_cell(amount), receipt, NOTE_EDITED)
-        else:
-            gsheets.update_entry(prof.sheet_id, rec.sheet_name, rec.row,
-                                 str(date), kind, str(content),
-                                 _amount_cell(amount), receipt, NOTE_EDITED)
+        # フラット2タブ型では記録先タブは種別で決まる（日付では変わらない）ので、
+        # 日付を修正しても同じ行をその場で更新すればよい。
+        gsheets.update_entry(prof.sheet_id, rec.sheet_name, rec.row,
+                             str(date), kind, str(content),
+                             _amount_cell(amount), receipt, NOTE_EDITED)
 
         rec.data  = {'date': date, 'content': content, 'amount': amount}
         rec.store = store

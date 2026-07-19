@@ -1,11 +1,18 @@
-"""スプレッドシートへの記録。
+"""スプレッドシートへの記録（フラット2タブ型フォーマット）。
 
-月ごとに1シート（年度は2月始まり＝既存の収支報告に合わせる）＋「全体収支」の集計シート。
-支出と収入は「種別」列で区別して1つの表に並べる。合計は列全体を対象にした
-SUMIF なので、1か月あたりの行数に上限が無い。
+支出は「支出」タブ、収入は「収入」タブに1行ずつ追記する（種別＝タブ）。
+月別の集計は「全体収支」タブが SUMIFS（日付の範囲で月を判定）で自動計算する。
+会計年度は FISCAL_START_YEAR / FISCAL_START_MONTH（既定: 2026年2月始まり）。
 
 シートIDは引数で受け取り、モジュール内でグローバル設定を読まない。
 チャンネルごとに別アカウント・別スプレッドシートへ記録できるようにするため。
+
+bot.py へ提供する公開インターフェース:
+    KIND_EXPENSE / KIND_INCOME          種別（＝タブ名）
+    init_workbook(sheet_id)             支出/収入/全体収支タブを用意（冪等）
+    append_entry(sheet_id, date, kind, content, amount, receipt, note) -> (タブ名, 行)
+    update_entry(sheet_id, sheet_name, row, date, kind, content, amount, receipt, note)
+    receipt_cell(url, filename)         領収書等セル（Driveハイパーリンク）
 """
 import re
 
@@ -16,40 +23,23 @@ import config
 
 _SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
-HEADERS        = ['日付', '種別', '内容', '金額', '領収書等', '備考']
-HEADER_ROW     = 5   # 見出し行
-FIRST_DATA_ROW = 6   # データはここから下（合計式もこの行以降だけを見る）
+# タブ名。種別＝タブなので KIND_* がそのままタブ名になる。
+KIND_EXPENSE   = '支出'
+KIND_INCOME    = '収入'
 OVERVIEW_SHEET = '全体収支'
 
-KIND_EXPENSE = '支出'
-KIND_INCOME  = '収入'
+# データタブの見出し（既存の本番シートと同じ5列）
+HEADERS = ['日付', '内容', '金額', '領収書等', '備考']
 
-# 年度は2月始まり。全体収支シートの並び順もこれに従う。
-FISCAL_MONTHS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1]
-
-_DATE_FMT  = {'numberFormat': {'type': 'DATE',   'pattern': 'd'}}
-_MONEY_FMT = {'numberFormat': {'type': 'NUMBER', 'pattern': '[$¥-411]#,##0'}}
-
-_FULLWIDTH = str.maketrans('0123456789', '０１２３４５６７８９')
+# 会計年度（全体収支の月別集計はこの範囲で日付を月に振り分ける）
+FISCAL_START_YEAR  = 2026
+FISCAL_START_MONTH = 2   # 2月始まり
 
 
-# ── 名前とセルの組み立て ──────────────────────────────────
-
-def month_sheet_name(month: int) -> str:
-    """7 → '７月'（既存の収支報告に合わせて全角）。"""
-    return str(month).translate(_FULLWIDTH) + '月'
-
-
-def sheet_name_for_date(value) -> str:
-    """'2026-07-17' → '７月'。"""
-    m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})$', str(value).strip())
-    if not m:
-        raise ValueError(f'日付を YYYY-MM-DD として解釈できません: {value!r}')
-    return month_sheet_name(int(m.group(2)))
-
+# ── セルの組み立て ────────────────────────────────────────
 
 def receipt_cell(url: str, filename: str) -> str:
-    """領収書等セル。ファイル名を表示しつつDriveへリンクする。"""
+    """領収書等セル。ファイル名を表示しつつ Drive へリンクする。"""
     if not url:
         return filename or ''
     label = (filename or 'リンク').replace('"', '""')
@@ -57,15 +47,14 @@ def receipt_cell(url: str, filename: str) -> str:
 
 
 def _row_number(updated_range: str) -> int:
-    """append の updatedRange（例: '７月'!A6:F6）から行番号 6 を取り出す。"""
+    """append の updatedRange（例: '支出'!A16:E16）から行番号 16 を取り出す。"""
     first_cell = updated_range.split('!')[-1].split(':')[0]
     return int(re.sub(r'\D', '', first_cell))
 
 
 def _service():
     creds = Credentials.from_service_account_info(
-        config.service_account_info(),
-        scopes=_SCOPES,
+        config.service_account_info(), scopes=_SCOPES,
     )
     return build('sheets', 'v4', credentials=creds)
 
@@ -75,108 +64,93 @@ def _sheet_ids(svc, sheet_id: str) -> dict:
     return {s['properties']['title']: s['properties']['sheetId'] for s in meta['sheets']}
 
 
-# ── 初期化 ────────────────────────────────────────────────
+# ── 全体収支の月別集計（SUMIFS）──────────────────────────
 
-def _month_layout(name: str) -> list:
-    """月シートの固定部分（合計欄と見出し）。
+def _fiscal_months() -> list[tuple[int, int, int, int]]:
+    """会計年度の12か月を (年, 月, 翌月の年, 翌月) で返す。"""
+    out = []
+    for i in range(12):
+        idx = (FISCAL_START_MONTH - 1) + i
+        y, m = FISCAL_START_YEAR + idx // 12, idx % 12 + 1
+        ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+        out.append((y, m, ny, nm))
+    return out
 
-    合計式の範囲を6行目以降に限定しているのは、B列全体を対象にすると
-    式自身（B1〜B3）を含んでしまい循環参照になるため。開始行を固定した
-    開放範囲（B6:B）なので行数の上限は無い。
-    """
-    return [
-        {'range': f"'{name}'!A1:B3", 'values': [
-            ['支出合計', f'=SUMIF(B{FIRST_DATA_ROW}:B,"{KIND_EXPENSE}",D{FIRST_DATA_ROW}:D)'],
-            ['収入合計', f'=SUMIF(B{FIRST_DATA_ROW}:B,"{KIND_INCOME}",D{FIRST_DATA_ROW}:D)'],
-            ['収支',     '=B2-B1'],
-        ]},
-        {'range': f"'{name}'!A{HEADER_ROW}:F{HEADER_ROW}", 'values': [HEADERS]},
-    ]
+
+def _sumifs(tab: str, y: int, m: int, ny: int, nm: int) -> str:
+    """その月の金額合計を出す SUMIFS 数式。日付(A列)の範囲で月を判定する。"""
+    return (f'=SUMIFS({tab}!$C:$C,{tab}!$A:$A,">="&DATE({y},{m},1),'
+            f'{tab}!$A:$A,"<"&DATE({ny},{nm},1))')
 
 
 def _overview_layout() -> list:
-    rows = [['月', '支出合計', '収入合計', '収支']]
-    for i, month in enumerate(FISCAL_MONTHS):
-        r = 4 + i                       # 見出しが3行目なのでデータは4行目から
-        ref = f"'{month_sheet_name(month)}'"
-        rows.append([f'{month}月', f'={ref}!B1', f'={ref}!B2', f'=C{r}-B{r}'])
-    last = 4 + len(FISCAL_MONTHS) - 1
-    rows.append(['合計', f'=SUM(B4:B{last})', f'=SUM(C4:C{last})', f'=SUM(D4:D{last})'])
-    return [{'range': f"'{OVERVIEW_SHEET}'!A3:D{last + 1}", 'values': rows}]
+    months = _fiscal_months()
+    labels = [f'{m}月' for _, m, _, _ in months]
+    exp = [_sumifs(KIND_EXPENSE, *mo) for mo in months]
+    inc = [_sumifs(KIND_INCOME, *mo) for mo in months]
+    ov = OVERVIEW_SHEET
+    return [
+        {'range': f"'{ov}'!A1:F1", 'values': [[
+            '支出合計', f'=SUM({KIND_EXPENSE}!C:C)',
+            '収入合計', f'=SUM({KIND_INCOME}!C:C)',
+            '収支', '=D1-B1']]},
+        {'range': f"'{ov}'!A3", 'values': [['支出（月別）']]},
+        {'range': f"'{ov}'!A4", 'values': [labels]},
+        {'range': f"'{ov}'!A5", 'values': [exp]},
+        {'range': f"'{ov}'!A7", 'values': [['収入（月別）']]},
+        {'range': f"'{ov}'!A8", 'values': [labels]},
+        {'range': f"'{ov}'!A9", 'values': [inc]},
+    ]
 
 
-def _format_requests(sid: int, is_month: bool) -> list:
-    """見出しの装飾・固定・列幅・数値書式。"""
-    header_row = HEADER_ROW - 1 if is_month else 2   # 0始まり
-    reqs = [
+# ── 装飾 ──────────────────────────────────────────────────
+
+def _format_data_sheet(sid: int) -> list:
+    return [
         {'repeatCell': {
-            'range': {'sheetId': sid, 'startRowIndex': header_row, 'endRowIndex': header_row + 1},
+            'range': {'sheetId': sid, 'startRowIndex': 0, 'endRowIndex': 1},
             'cell': {'userEnteredFormat': {
                 'textFormat': {'bold': True},
-                'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9},
-            }},
-            'fields': 'userEnteredFormat(textFormat,backgroundColor)',
-        }},
+                'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}}},
+            'fields': 'userEnteredFormat(textFormat,backgroundColor)'}},
         {'updateSheetProperties': {
-            'properties': {'sheetId': sid,
-                           'gridProperties': {'frozenRowCount': header_row + 1}},
-            'fields': 'gridProperties.frozenRowCount',
-        }},
-        {'repeatCell': {
-            'range': {'sheetId': sid, 'startRowIndex': 0, 'endRowIndex': 3,
+            'properties': {'sheetId': sid, 'gridProperties': {'frozenRowCount': 1}},
+            'fields': 'gridProperties.frozenRowCount'}},
+        {'repeatCell': {  # 日付列（データ部）
+            'range': {'sheetId': sid, 'startRowIndex': 1,
                       'startColumnIndex': 0, 'endColumnIndex': 1},
-            'cell': {'userEnteredFormat': {'textFormat': {'bold': True}}},
-            'fields': 'userEnteredFormat.textFormat',
-        }},
+            'cell': {'userEnteredFormat': {'numberFormat': {'type': 'DATE', 'pattern': 'yyyy-mm-dd'}}},
+            'fields': 'userEnteredFormat.numberFormat'}},
+        {'repeatCell': {  # 金額列（データ部）
+            'range': {'sheetId': sid, 'startRowIndex': 1,
+                      'startColumnIndex': 2, 'endColumnIndex': 3},
+            'cell': {'userEnteredFormat': {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}}},
+            'fields': 'userEnteredFormat.numberFormat'}},
+        {'updateDimensionProperties': {
+            'range': {'sheetId': sid, 'dimension': 'COLUMNS', 'startIndex': 0, 'endIndex': 5},
+            'properties': {'pixelSize': 150}, 'fields': 'pixelSize'}},
     ]
-    if is_month:
-        reqs += [
-            # 日付列: 値は YYYY-MM-DD で持ち、表示だけ日にする
-            {'repeatCell': {
-                'range': {'sheetId': sid, 'startRowIndex': FIRST_DATA_ROW - 1,
-                          'startColumnIndex': 0, 'endColumnIndex': 1},
-                'cell': {'userEnteredFormat': _DATE_FMT},
-                'fields': 'userEnteredFormat.numberFormat',
-            }},
-            # 金額列（データ部）と合計欄
-            {'repeatCell': {
-                'range': {'sheetId': sid, 'startRowIndex': FIRST_DATA_ROW - 1,
-                          'startColumnIndex': 3, 'endColumnIndex': 4},
-                'cell': {'userEnteredFormat': _MONEY_FMT},
-                'fields': 'userEnteredFormat.numberFormat',
-            }},
-            {'repeatCell': {
-                'range': {'sheetId': sid, 'startRowIndex': 0, 'endRowIndex': 3,
-                          'startColumnIndex': 1, 'endColumnIndex': 2},
-                'cell': {'userEnteredFormat': _MONEY_FMT},
-                'fields': 'userEnteredFormat.numberFormat',
-            }},
-            {'updateDimensionProperties': {
-                'range': {'sheetId': sid, 'dimension': 'COLUMNS',
-                          'startIndex': 0, 'endIndex': 6},
-                'properties': {'pixelSize': 150},
-                'fields': 'pixelSize',
-            }},
-        ]
-    else:
-        reqs.append({'repeatCell': {
-            'range': {'sheetId': sid, 'startRowIndex': 3,
-                      'startColumnIndex': 1, 'endColumnIndex': 4},
-            'cell': {'userEnteredFormat': _MONEY_FMT},
-            'fields': 'userEnteredFormat.numberFormat',
-        }})
-    return reqs
 
+
+def _format_overview(sid: int) -> list:
+    # 1行目・4行目(支出見出し)・8行目(収入見出し)を太字に
+    return [{'repeatCell': {
+        'range': {'sheetId': sid, 'startRowIndex': r, 'endRowIndex': r + 1},
+        'cell': {'userEnteredFormat': {'textFormat': {'bold': True}}},
+        'fields': 'userEnteredFormat.textFormat'}} for r in (0, 3, 7)]
+
+
+# ── 初期化 ────────────────────────────────────────────────
 
 def init_workbook(sheet_id: str) -> list:
-    """全体収支＋12か月分のシートを作る。何度実行しても安全。
+    """支出/収入/全体収支タブを用意する。何度実行しても安全（冪等）。
 
-    月シートを最初に全部作るのは、全体収支の集計式が存在しないシートを
-    参照すると #REF! になるため。作成したシート名を返す。
+    既存タブがあればデータ行には触れず、見出し(1行目)と全体収支の数式だけ
+    書き直す。無いタブだけ新規作成する。作成したタブ名の一覧を返す。
     """
     svc      = _service()
     existing = _sheet_ids(svc, sheet_id)
-    wanted   = [OVERVIEW_SHEET] + [month_sheet_name(m) for m in FISCAL_MONTHS]
+    wanted   = [KIND_EXPENSE, KIND_INCOME, OVERVIEW_SHEET]
 
     created = [n for n in wanted if n not in existing]
     if created:
@@ -187,27 +161,22 @@ def init_workbook(sheet_id: str) -> list:
         ).execute()
         existing = _sheet_ids(svc, sheet_id)
 
-    # 中身（見出しと式）を書く
-    data = _overview_layout()
-    for m in FISCAL_MONTHS:
-        data += _month_layout(month_sheet_name(m))
+    # 見出し（1行目のみ）と全体収支の数式を書く。データ行(2行目以降)は触らない。
+    data = [
+        {'range': f"'{KIND_EXPENSE}'!A1:E1", 'values': [HEADERS]},
+        {'range': f"'{KIND_INCOME}'!A1:E1",  'values': [HEADERS]},
+    ] + _overview_layout()
     svc.spreadsheets().values().batchUpdate(
         spreadsheetId=sheet_id,
         body={'valueInputOption': 'USER_ENTERED', 'data': data},
     ).execute()
 
     # 装飾
-    reqs = _format_requests(existing[OVERVIEW_SHEET], is_month=False)
-    for m in FISCAL_MONTHS:
-        reqs += _format_requests(existing[month_sheet_name(m)], is_month=True)
-
-    # 新規スプレッドシートの既定シートが残っていたら消す
-    for title, sid in existing.items():
-        if title not in wanted:
-            reqs.append({'deleteSheet': {'sheetId': sid}})
-
-    svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                                   body={'requests': reqs}).execute()
+    reqs = (_format_data_sheet(existing[KIND_EXPENSE])
+            + _format_data_sheet(existing[KIND_INCOME])
+            + _format_overview(existing[OVERVIEW_SHEET]))
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id, body={'requests': reqs}).execute()
     return created
 
 
@@ -215,27 +184,27 @@ def init_workbook(sheet_id: str) -> list:
 
 def append_entry(sheet_id: str, date: str, kind: str, content: str,
                  amount, receipt: str, note: str) -> tuple[str, int]:
-    """日付の月のシートに1行追記し、(シート名, 行番号) を返す。"""
-    name = sheet_name_for_date(date)
-    # OVERWRITE で既存の空行に書き込む。INSERT_ROWS だと合計式より上に行が
-    # 挿入され、SUMIF の範囲（B6:B）が自動でずれて集計から漏れるため。
-    # 空行には初期化時の日付/金額書式が付いているので表示も崩れない。
+    """種別のタブ（支出/収入）に1行追記し、(タブ名, 行番号) を返す。
+
+    全体収支の集計は列全体を対象にした SUMIFS なので、末尾に追記しても
+    範囲がずれず自動で反映される。
+    """
     resp = _service().spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range=f"'{name}'!A{FIRST_DATA_ROW}:F",
+        range=f"'{kind}'!A:E",
         valueInputOption='USER_ENTERED',
-        insertDataOption='OVERWRITE',
-        body={'values': [[date, kind, content, amount, receipt, note]]},
+        insertDataOption='INSERT_ROWS',
+        body={'values': [[date, content, amount, receipt, note]]},
     ).execute()
-    return name, _row_number(resp['updates']['updatedRange'])
+    return kind, _row_number(resp['updates']['updatedRange'])
 
 
 def update_entry(sheet_id: str, sheet_name: str, row: int, date: str, kind: str,
                  content: str, amount, receipt: str, note: str):
-    """記録済みの1行を上書きする。"""
+    """記録済みの1行を上書きする（タブ＝種別なので kind は使わない）。"""
     _service().spreadsheets().values().update(
         spreadsheetId=sheet_id,
-        range=f"'{sheet_name}'!A{row}:F{row}",
+        range=f"'{sheet_name}'!A{row}:E{row}",
         valueInputOption='USER_ENTERED',
-        body={'values': [[date, kind, content, amount, receipt, note]]},
+        body={'values': [[date, content, amount, receipt, note]]},
     ).execute()
