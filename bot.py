@@ -7,14 +7,12 @@ import discord
 from discord.ext import commands
 
 import config
+import gsheets
+from gdrive import DriveClient
 from gemini import parse_receipt, parse_income_text, parse_followup, parse_edit
-from gdrive import upload_receipt, rename_file
-from gsheets import append_expense, append_income, update_expense, update_income
 
-RECEIPT_CHANNEL_ID = config.RECEIPT_CHANNEL_ID
-INCOME_CHANNEL_ID  = config.INCOME_CHANNEL_ID
-PENDING_TTL        = 600   # 確定前の会話が10分で失効
-RECORDED_TTL       = 3600  # 記録済みエントリを修正できる猶予（1時間）
+PENDING_TTL  = 600   # 確定前の会話が10分で失効
+RECORDED_TTL = 3600  # 記録済みエントリを修正できる猶予（1時間）
 
 NOTE_NEW    = 'AI自動記録（Gemini）'
 NOTE_EDITED = 'AI自動記録（Gemini）／修正あり'
@@ -22,6 +20,12 @@ NOTE_EDITED = 'AI自動記録（Gemini）／修正あり'
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# channel_id → Profile / DriveClient（__main__ の setup で埋める）
+_profiles: dict[int, config.Profile] = {}
+_drives:   dict[int, DriveClient]    = {}
+# 既に月シート一式を用意済みのスプレッドシートID
+_initialized_sheets: set[str] = set()
 
 
 @dataclass
@@ -42,7 +46,8 @@ class RecordedEntry:
     """記録済みエントリ。あとから修正指示を受けて上書きするために保持する。"""
     entry_type: str
     data: dict                  # date, content, amount
-    row: int                    # スプレッドシート上の行番号
+    sheet_name: str             # 記録した月シート名（例: '７月'）
+    row: int                    # そのシート上の行番号
     store: Optional[str] = None
     items: list = field(default_factory=list)
     drive_file_id: Optional[str] = None
@@ -54,12 +59,15 @@ class RecordedEntry:
 
 # (channel_id, user_id) → PendingEntry
 _pending: dict[tuple[int, int], PendingEntry] = {}
-
 # (channel_id, user_id) → 直近に記録した RecordedEntry
 _recorded: dict[tuple[int, int], RecordedEntry] = {}
 
 
 # ── ヘルパー ──────────────────────────────────────────────
+
+def _kind_ja(entry_type: str) -> str:
+    return gsheets.KIND_EXPENSE if entry_type == 'expense' else gsheets.KIND_INCOME
+
 
 def _missing(data: dict) -> list[str]:
     labels = {'date': '日付', 'content': '内容', 'amount': '金額'}
@@ -80,6 +88,12 @@ def _to_int(val) -> Optional[int]:
         return None
 
 
+def _amount_cell(val):
+    """シートに書く金額。数値化できれば数値、無理ならそのまま。"""
+    n = _to_int(val)
+    return n if n is not None else val
+
+
 def _render_content(store, items: list) -> Optional[str]:
     """店名と品目から「内容」列の文字列を組み立てる。"""
     items_str = '、'.join(
@@ -90,7 +104,7 @@ def _render_content(store, items: list) -> Optional[str]:
 
 
 def _summary(entry_type: str, data: dict) -> str:
-    kind = '支出' if entry_type == 'expense' else '収入'
+    kind = _kind_ja(entry_type)
     lines = [
         f'**【{kind}】**',
         f'📅 日付 : {data.get("date") or "❓ 不明"}',
@@ -126,13 +140,21 @@ def _make_filename(date, content, ext) -> str:
     return f'{date_raw}_{store_raw}.{ext or "jpg"}'
 
 
+def _ensure_workbook(sheet_id: str) -> None:
+    """月シート一式を用意する（未初期化のスプレッドシートのみ・冪等）。"""
+    if sheet_id in _initialized_sheets:
+        return
+    gsheets.init_workbook(sheet_id)
+    _initialized_sheets.add(sheet_id)
+
+
 # ── イベントハンドラ ──────────────────────────────────────
 
 @bot.event
 async def on_ready():
     print(f'起動: {bot.user}')
-    print(f'  領収書ch: {RECEIPT_CHANNEL_ID}')
-    print(f'  収入ch  : {INCOME_CHANNEL_ID}')
+    for p in _profiles.values():
+        print(f'  [{p.name}] ch={p.channel_id} mode={p.mode} sheet={p.sheet_id[:12]}…')
 
 
 @bot.event
@@ -140,8 +162,8 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    key = (message.channel.id, message.author.id)
-    ch  = message.channel.id
+    key  = (message.channel.id, message.author.id)
+    prof = _profiles.get(message.channel.id)
 
     # ── 進行中の会話があれば優先処理 ──
     if key in _pending:
@@ -153,8 +175,12 @@ async def on_message(message: discord.Message):
         await _handle_followup(message, key, entry)
         return
 
+    if prof is None:
+        await bot.process_commands(message)
+        return
+
     # ── 新規: レシート画像（支出） ──
-    if ch == RECEIPT_CHANNEL_ID:
+    if prof.accepts_receipt:
         imgs = [a for a in message.attachments
                 if a.content_type and a.content_type.startswith('image/')]
         if imgs:
@@ -169,7 +195,7 @@ async def on_message(message: discord.Message):
             return
 
         # ── 新規: 収入テキスト ──
-        if ch == INCOME_CHANNEL_ID:
+        if prof.accepts_income:
             await _start_income(message, key)
             return
 
@@ -216,8 +242,7 @@ async def _start_expense(message: discord.Message, key: tuple, att: discord.Atta
 
     except Exception as e:
         import traceback
-        tb = traceback.format_exc()
-        print(f'[bot] _start_expense error:\n{tb}', flush=True)
+        print(f'[bot] _start_expense error:\n{traceback.format_exc()}', flush=True)
         await status.edit(content=f'❌ エラー: {e}')
 
 
@@ -284,9 +309,15 @@ async def _handle_followup(message: discord.Message, key: tuple, entry: PendingE
 # ── 確定・記録 ────────────────────────────────────────────
 
 async def _finalize(message: discord.Message, key: tuple, entry: PendingEntry):
+    prof = _profiles.get(message.channel.id)
+    if prof is None:
+        await message.reply('❌ このチャンネルには記録先が設定されていません。')
+        return
+
     status = await message.reply('⏳ 記録中...')
     try:
         d = entry.data
+        _ensure_workbook(prof.sheet_id)
 
         # 確定前のやり取りで content が直接書き換えられていると store/items と対応しない。
         # その場合は構造を捨て、内容を1つの文字列として扱う（合計の再計算は諦める）。
@@ -296,39 +327,36 @@ async def _finalize(message: discord.Message, key: tuple, entry: PendingEntry):
             store, items = d['content'], []
 
         if entry.entry_type == 'expense':
-            filename        = _make_filename(d['date'], d['content'], entry.original_ext)
-            file_id, link   = upload_receipt(entry.image_data, filename, entry.mime_type)
-            row = append_expense(
-                date=str(d['date']),
-                content=str(d['content']),
-                amount=str(d['amount']),
-                drive_link=link,
-                note=NOTE_NEW,
-            )
+            filename      = _make_filename(d['date'], d['content'], entry.original_ext)
+            file_id, link = _drives[prof.channel_id].upload_receipt(
+                entry.image_data, filename, entry.mime_type)
+            receipt = gsheets.receipt_cell(link, filename)
+            sheet_name, row = gsheets.append_entry(
+                prof.sheet_id, str(d['date']), gsheets.KIND_EXPENSE,
+                str(d['content']), _amount_cell(d['amount']), receipt, NOTE_NEW)
             _recorded[key] = RecordedEntry(
-                entry_type='expense', data=dict(d), row=row,
+                entry_type='expense', data=dict(d), sheet_name=sheet_name, row=row,
                 store=store, items=items,
                 drive_file_id=file_id, drive_link=link, filename=filename,
                 original_ext=entry.original_ext,
             )
             await status.edit(content=(
-                f'✅ **支出を記録しました**\n'
+                f'✅ **支出を記録しました**（{prof.name}／{sheet_name}）\n'
                 f'{_summary(entry.entry_type, d)}\n'
                 f'🗂 ファイル: `{filename}`\n'
                 f'🔗 Drive: {link}'
             ))
         else:
-            row = append_income(
-                date=str(d['date']),
-                content=str(d['content']),
-                amount=str(d['amount']),
-                note=NOTE_NEW,
-            )
+            sheet_name, row = gsheets.append_entry(
+                prof.sheet_id, str(d['date']), gsheets.KIND_INCOME,
+                str(d['content']), _amount_cell(d['amount']), '', NOTE_NEW)
             _recorded[key] = RecordedEntry(
-                entry_type='income', data=dict(d), row=row,
+                entry_type='income', data=dict(d), sheet_name=sheet_name, row=row,
                 store=d['content'], items=[],
             )
-            await status.edit(content=f'✅ **収入を記録しました**\n{_summary(entry.entry_type, d)}')
+            await status.edit(content=(
+                f'✅ **収入を記録しました**（{prof.name}／{sheet_name}）\n'
+                f'{_summary(entry.entry_type, d)}'))
 
     except Exception as e:
         import traceback
@@ -397,31 +425,47 @@ async def _try_edit(message: discord.Message, key: tuple, text: str) -> bool:
 
 
 async def _apply_edit(message: discord.Message, rec: RecordedEntry, result: dict):
+    prof = _profiles.get(message.channel.id)
+    if prof is None:
+        return
     status = await message.reply('✏️ 記録を修正中...')
     try:
         date   = result.get('date')  or rec.data.get('date')
         store  = result.get('store') or rec.store
         items  = result.get('items') if result.get('items') is not None else rec.items
         amount = _edited_amount(rec, items, result.get('total'))
+        kind   = _kind_ja(rec.entry_type)
 
         if rec.entry_type == 'expense':
             content  = _render_content(store, items)
             filename = _make_filename(date, content, rec.original_ext)
             if rec.drive_file_id and filename != rec.filename:
-                rename_file(rec.drive_file_id, filename)
+                _drives[prof.channel_id].rename_file(rec.drive_file_id, filename)
                 rec.filename = filename
-            update_expense(rec.row, str(date), str(content), str(amount),
-                           rec.drive_link, NOTE_EDITED)
+            receipt = gsheets.receipt_cell(rec.drive_link, rec.filename)
         else:
-            content = store
-            update_income(rec.row, str(date), str(content), str(amount), NOTE_EDITED)
+            content, receipt = store, ''
+
+        # 日付の月が変わると記録先シートも変わる。元シートの行を消して
+        # 新しい月シートへ入れ直す（更新だけだと前月に残ってしまう）。
+        new_sheet = gsheets.sheet_name_for_date(date)
+        if new_sheet != rec.sheet_name:
+            gsheets.update_entry(prof.sheet_id, rec.sheet_name, rec.row,
+                                 '', '', '', '', '', '')  # 元の行を空にする
+            rec.sheet_name, rec.row = gsheets.append_entry(
+                prof.sheet_id, str(date), kind, str(content),
+                _amount_cell(amount), receipt, NOTE_EDITED)
+        else:
+            gsheets.update_entry(prof.sheet_id, rec.sheet_name, rec.row,
+                                 str(date), kind, str(content),
+                                 _amount_cell(amount), receipt, NOTE_EDITED)
 
         rec.data  = {'date': date, 'content': content, 'amount': amount}
         rec.store = store
         rec.items = items
         rec.ts    = time.time()
 
-        lines = [f'✏️ **記録を修正しました**', _summary(rec.entry_type, rec.data)]
+        lines = ['✏️ **記録を修正しました**', _summary(rec.entry_type, rec.data)]
         if rec.entry_type == 'expense':
             lines.append(f'🗂 ファイル: `{rec.filename}`')
             lines.append(f'🔗 Drive: {rec.drive_link}')
@@ -445,6 +489,32 @@ async def cancel_cmd(ctx: commands.Context):
         await ctx.reply('進行中の記録はありません。')
 
 
+@bot.command(name='初期化')
+async def init_cmd(ctx: commands.Context):
+    """このチャンネルのスプレッドシートに月シート一式を用意する。"""
+    prof = _profiles.get(ctx.channel.id)
+    if prof is None:
+        await ctx.reply('このチャンネルには記録先が設定されていません。')
+        return
+    status = await ctx.reply(f'🛠 「{prof.name}」のシートを初期化中...')
+    try:
+        created = gsheets.init_workbook(prof.sheet_id)
+        _initialized_sheets.add(prof.sheet_id)
+        msg = f'✅ 初期化しました（新規作成: {len(created)}シート）' if created \
+            else '✅ 既に初期化済みでした'
+        await status.edit(content=msg)
+    except Exception as e:
+        await status.edit(content=f'❌ 初期化に失敗: {e}')
+
+
+def setup() -> None:
+    profiles = config.validate()
+    for p in profiles:
+        _profiles[p.channel_id] = p
+        _drives[p.channel_id] = DriveClient(
+            p.drive_token, p.drive_folder_id, p.drive_token_path)
+
+
 if __name__ == '__main__':
-    config.validate()
+    setup()
     bot.run(config.DISCORD_TOKEN)
