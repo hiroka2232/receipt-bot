@@ -39,6 +39,7 @@ class PendingEntry:
     original_ext: Optional[str] = None  # jpg / png など
     store: Optional[str] = None         # data['content'] の組み立て元
     items: list = field(default_factory=list)
+    recorder: str = ''                  # レシート/収入を投稿した人のサーバー表示名
 
 
 @dataclass
@@ -54,6 +55,7 @@ class RecordedEntry:
     drive_link: str = ''
     filename: Optional[str] = None
     original_ext: Optional[str] = None
+    recorder: str = ''                  # レシート/収入を投稿した人のサーバー表示名
     ts: float = field(default_factory=time.time)
 
 
@@ -67,6 +69,11 @@ _recorded: dict[tuple[int, int], RecordedEntry] = {}
 
 def _kind_ja(entry_type: str) -> str:
     return gsheets.KIND_EXPENSE if entry_type == 'expense' else gsheets.KIND_INCOME
+
+
+def _display_name(author) -> str:
+    """投稿者の名前（サーバーのニックネームがあればそれ、無ければユーザー名）。"""
+    return getattr(author, 'display_name', None) or str(author)
 
 
 def _missing(data: dict) -> list[str]:
@@ -237,6 +244,7 @@ async def _start_expense(message: discord.Message, key: tuple, att: discord.Atta
             original_ext=ext,
             store=store,
             items=items,
+            recorder=_display_name(message.author),
         )
         _pending[key] = entry
         await status.edit(content=_build_message(entry))
@@ -264,6 +272,7 @@ async def _start_income(message: discord.Message, key: tuple):
             entry_type='income',
             data=entry_data,
             state='confirm' if not _missing(entry_data) else 'info',
+            recorder=_display_name(message.author),
         )
         _pending[key] = entry
         await status.edit(content=_build_message(entry))
@@ -334,30 +343,34 @@ async def _finalize(message: discord.Message, key: tuple, entry: PendingEntry):
             receipt = gsheets.receipt_cell(link, filename)
             sheet_name, row = gsheets.append_entry(
                 prof.sheet_id, str(d['date']), gsheets.KIND_EXPENSE,
-                str(d['content']), _amount_cell(d['amount']), receipt, NOTE_NEW)
+                str(d['content']), _amount_cell(d['amount']), receipt, NOTE_NEW,
+                entry.recorder)
             _recorded[key] = RecordedEntry(
                 entry_type='expense', data=dict(d), sheet_name=sheet_name, row=row,
                 store=store, items=items,
                 drive_file_id=file_id, drive_link=link, filename=filename,
-                original_ext=entry.original_ext,
+                original_ext=entry.original_ext, recorder=entry.recorder,
             )
             await status.edit(content=(
                 f'✅ **支出を記録しました**（{prof.name}／{sheet_name}）\n'
                 f'{_summary(entry.entry_type, d)}\n'
                 f'🗂 ファイル: `{filename}`\n'
-                f'🔗 Drive: {link}'
+                f'🔗 Drive: {link}\n'
+                f'🙋 記録者: {entry.recorder}'
             ))
         else:
             sheet_name, row = gsheets.append_entry(
                 prof.sheet_id, str(d['date']), gsheets.KIND_INCOME,
-                str(d['content']), _amount_cell(d['amount']), '', NOTE_NEW)
+                str(d['content']), _amount_cell(d['amount']), '', NOTE_NEW,
+                entry.recorder)
             _recorded[key] = RecordedEntry(
                 entry_type='income', data=dict(d), sheet_name=sheet_name, row=row,
-                store=d['content'], items=[],
+                store=d['content'], items=[], recorder=entry.recorder,
             )
             await status.edit(content=(
                 f'✅ **収入を記録しました**（{prof.name}／{sheet_name}）\n'
-                f'{_summary(entry.entry_type, d)}'))
+                f'{_summary(entry.entry_type, d)}\n'
+                f'🙋 記録者: {entry.recorder}'))
 
     except Exception as e:
         import traceback
@@ -451,7 +464,7 @@ async def _apply_edit(message: discord.Message, rec: RecordedEntry, result: dict
         # 日付を修正しても同じ行をその場で更新すればよい。
         gsheets.update_entry(prof.sheet_id, rec.sheet_name, rec.row,
                              str(date), kind, str(content),
-                             _amount_cell(amount), receipt, NOTE_EDITED)
+                             _amount_cell(amount), receipt, NOTE_EDITED, rec.recorder)
 
         rec.data  = {'date': date, 'content': content, 'amount': amount}
         rec.store = store

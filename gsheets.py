@@ -10,8 +10,8 @@
 bot.py へ提供する公開インターフェース:
     KIND_EXPENSE / KIND_INCOME          種別（＝タブ名）
     init_workbook(sheet_id)             支出/収入/全体収支タブを用意（冪等）
-    append_entry(sheet_id, date, kind, content, amount, receipt, note) -> (タブ名, 行)
-    update_entry(sheet_id, sheet_name, row, date, kind, content, amount, receipt, note)
+    append_entry(sheet_id, date, kind, content, amount, receipt, note, recorder) -> (タブ名, 行)
+    update_entry(sheet_id, sheet_name, row, date, kind, content, amount, receipt, note, recorder)
     receipt_cell(url, filename)         領収書等セル（Driveハイパーリンク）
 """
 import re
@@ -28,8 +28,8 @@ KIND_EXPENSE   = '支出'
 KIND_INCOME    = '収入'
 OVERVIEW_SHEET = '全体収支'
 
-# データタブの見出し（既存の本番シートと同じ5列）
-HEADERS = ['日付', '内容', '金額', '領収書等', '備考']
+# データタブの見出し（既存5列 + 記録者）
+HEADERS = ['日付', '内容', '金額', '領収書等', '備考', '記録者']
 
 # 会計年度（全体収支の月別集計はこの範囲で日付を月に振り分ける）
 FISCAL_START_YEAR  = 2026
@@ -127,7 +127,7 @@ def _format_data_sheet(sid: int) -> list:
             'cell': {'userEnteredFormat': {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}}},
             'fields': 'userEnteredFormat.numberFormat'}},
         {'updateDimensionProperties': {
-            'range': {'sheetId': sid, 'dimension': 'COLUMNS', 'startIndex': 0, 'endIndex': 5},
+            'range': {'sheetId': sid, 'dimension': 'COLUMNS', 'startIndex': 0, 'endIndex': 6},
             'properties': {'pixelSize': 150}, 'fields': 'pixelSize'}},
     ]
 
@@ -163,8 +163,8 @@ def init_workbook(sheet_id: str) -> list:
 
     # 見出し（1行目のみ）と全体収支の数式を書く。データ行(2行目以降)は触らない。
     data = [
-        {'range': f"'{KIND_EXPENSE}'!A1:E1", 'values': [HEADERS]},
-        {'range': f"'{KIND_INCOME}'!A1:E1",  'values': [HEADERS]},
+        {'range': f"'{KIND_EXPENSE}'!A1:F1", 'values': [HEADERS]},
+        {'range': f"'{KIND_INCOME}'!A1:F1",  'values': [HEADERS]},
     ] + _overview_layout()
     svc.spreadsheets().values().batchUpdate(
         spreadsheetId=sheet_id,
@@ -183,7 +183,7 @@ def init_workbook(sheet_id: str) -> list:
 # ── 記録 ──────────────────────────────────────────────────
 
 def append_entry(sheet_id: str, date: str, kind: str, content: str,
-                 amount, receipt: str, note: str) -> tuple[str, int]:
+                 amount, receipt: str, note: str, recorder: str = '') -> tuple[str, int]:
     """種別のタブ（支出/収入）に1行追記し、(タブ名, 行番号) を返す。
 
     全体収支の集計は列全体を対象にした SUMIFS なので、末尾に追記しても
@@ -191,20 +191,20 @@ def append_entry(sheet_id: str, date: str, kind: str, content: str,
     """
     resp = _service().spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range=f"'{kind}'!A:E",
+        range=f"'{kind}'!A:F",
         valueInputOption='USER_ENTERED',
         insertDataOption='INSERT_ROWS',
-        body={'values': [[date, content, amount, receipt, note]]},
+        body={'values': [[date, content, amount, receipt, note, recorder]]},
     ).execute()
     return kind, _row_number(resp['updates']['updatedRange'])
 
 
 def update_entry(sheet_id: str, sheet_name: str, row: int, date: str, kind: str,
-                 content: str, amount, receipt: str, note: str):
+                 content: str, amount, receipt: str, note: str, recorder: str = ''):
     """記録済みの1行を上書きする（タブ＝種別なので kind は使わない）。"""
     _service().spreadsheets().values().update(
         spreadsheetId=sheet_id,
-        range=f"'{sheet_name}'!A{row}:E{row}",
+        range=f"'{sheet_name}'!A{row}:F{row}",
         valueInputOption='USER_ENTERED',
-        body={'values': [[date, content, amount, receipt, note]]},
+        body={'values': [[date, content, amount, receipt, note, recorder]]},
     ).execute()
